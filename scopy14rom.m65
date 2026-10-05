@@ -1,0 +1,1573 @@
+; SCOPY14 - "sectorcopy" for Atari 8-bit, resident part
+; Disassembled with radare2 (gen.py), reassembles with ATasm 1.06.
+; Original by Erwin Reuss, Compyshop 06/87
+; (c) ABBUC e.V. 2026 (https://abbuc.de)
+; Licensed under GPLv2
+;
+; This code runs at $F000-$FFFF in the RAM under the OS ROM. It is stored
+; in SCOPY14.COM at $3000-$3FFF and moved up by the loader (scopy14.m65).
+; Build as raw binary:   atasm -r -oscopy14rom.bin scopy14rom.m65
+;
+;   $F000-$F3FF  character set (zero here, the loader copies the ROM font in)
+;   $F400        display list (DLIST), screen texts
+;   $F4ED        cold start (entered from the loader stub)
+;   $FC05        print inline string: JSR, then text at $FE7C+Y,
+;                terminated by $EA (a NOP that execution continues at)
+;   $FE7C        screen line buffer
+;   $FFFA        NMI / RESET / IRQ vectors
+
+COLPF0  = $D016
+CONSOL  = $D01F
+AUDF1   = $D200
+AUDC1   = $D201
+AUDF3   = $D204
+AUDF4   = $D206
+AUDC4   = $D207
+AUDCTL  = $D208
+SKRES   = $D20A
+SEROUT  = $D20D
+SERIN   = $D20D
+IRQEN   = $D20E
+IRQST   = $D20E
+SKSTAT  = $D20F
+SKCTL   = $D20F
+PORTB   = $D301
+PBCTL   = $D303
+DLISTL  = $D402
+DLISTH  = $D403
+WSYNC   = $D40A
+VCOUNT  = $D40B
+NMIST   = $D40F
+NMIRES  = $D40F
+
+; --- variables -------------------------------------------------------------
+POKMSK   = $10          ; OS: POKEY IRQ mask (restored after SIO)
+DRVSPD   = $1B          ; POKEY divisor per drive, DRVSPD+unit (1-4)
+DUNIT    = $21          ; SIO: drive number
+DCOMND   = $22          ; SIO: command
+DSTATS   = $23          ; SIO: direction ($40 in, $80 out) / status
+DBUF     = $24          ; SIO: buffer address (2 bytes)
+DBYT     = $28          ; SIO: byte count (2 bytes)
+DAUX     = $2A          ; SIO: aux1/aux2 = sector number (2 bytes)
+SIOSTAT  = $30          ; SIO: result status
+CHKSUM   = $31          ; SIO: frame checksum
+FRMPTR   = $32          ; SIO: frame address (2 bytes)
+FRMLEN   = $34          ; SIO: frame length
+RETRY    = $36          ; SIO: retries left
+RBARPOS  = $37          ; read progress bar: screen offset
+RBARQ    = $38          ; read progress bar: quarter 0-3
+RBARCNT  = $39          ; read progress bar: sector count
+PROGTMP  = $3A          ; PROGRESS: temp
+WBARPOS  = $3B          ; write progress bar: screen offset
+WBARQ    = $3C          ; write progress bar: quarter 0-3
+WBARCNT  = $3D          ; write progress bar: sector count
+SECSTEP  = $3E          ; sectors per progress bar step
+TGTFMTD  = $3F          ; <> 0: target already formatted
+PRPTR    = $43          ; PRINTI: text pointer (2 bytes)
+ATRACT   = $4D          ; OS: attract mode counter
+SECTOR   = $60          ; current sector (2 bytes)
+NEXTSEC  = $62          ; first sector of the next pass (2 bytes)
+PASSSEC  = $64          ; first sector of this pass (2 bytes)
+BANKFLG  = $66          ; $FF: buffer is in the extended banks
+CURBANK  = $67          ; current extended bank
+NUMBANKS = $68          ; number of extended 16K banks
+SAVSPD   = $69          ; source high speed divisor during fallback
+RAMTOP   = $6A          ; end of main RAM (high byte: $80/$A0/$C0)
+SRCDRV   = $70          ; source drive
+DSTDRV   = $71          ; target drive
+SRCFAST  = $72          ; $FF: source is a high speed drive
+DSTFAST  = $73          ; $FF: target is a high speed drive
+NOFMT    = $74          ; 0: "Formatieren: JA"
+RETRIES  = $75          ; SIO retry count
+LASTPASS = $76          ; write passes of the last copy (0: image in RAM)
+TEMP     = $7A          ; temporary
+SAVDIR   = $7B          ; SIOTRY2: saved direction
+TWODRV   = $7C          ; SRCDRV xor DSTDRV, 0: copy with one drive
+DENSITY  = $7D          ; $00 single, $20 double, $80 medium
+WPASS    = $7E          ; write pass counter, $FF before the first
+SLOWFLG  = $7F          ; $FF: source fell back to normal speed
+RESTART  = $0100        ; RESET restart routine (loader stub)
+TIMER    = $0218        ; SIO timeout counter in frames (2 bytes)
+TIMVEC   = $0226        ; timer expiry vector (2 bytes)
+CMDFRM   = $023A        ; SIO command frame: device, command, aux1, aux2
+SIOSTK   = $0318        ; stack pointer for the SIO error exit
+NORETRY  = $0319        ; $FF: no command retry any more
+SECBUF   = $0400        ; start of the sector buffer
+BANKWIN  = $4000        ; extended RAM bank window $4000-$7FFF
+
+        *= $F000
+
+        .REPT 1024
+        .BYTE $00
+        .ENDR
+; --- display list -----------------------------------------------------------
+DLIST
+        .BYTE $70,$70,$70 ; 24 blank lines
+        .BYTE $46       ; GR.1 line: dashes
+        .WORD DASHES
+        .BYTE $47       ; GR.2 line: title
+        .WORD TITLE
+        .BYTE $40       ; 5 blank lines
+        .BYTE $06       ; GR.1 line: credit (follows the title)
+        .BYTE $10       ; 2 blank lines
+        .BYTE $46       ; GR.1 line: dashes
+        .WORD DASHES
+        .BYTE $70
+        .BYTE $42       ; 6 text lines (GR.0) from SCREEN
+        .WORD SCREEN
+        .BYTE $30,$02,$30,$70,$02,$70,$50,$02,$70,$20,$02,$70,$20,$02,$70,$20
+        .BYTE $46       ; GR.1 line: dashes
+        .WORD DASHES
+        .BYTE $46       ; GR.1 line: status message, the program
+MSGLMS                          ; selects one by changing this pointer
+        .WORD MSGSETUP
+        .BYTE $10
+        .BYTE $46       ; GR.1 line: dashes
+        .WORD DASHES
+        .BYTE $41       ; wait for VBL, jump back to the start
+        .WORD DLIST
+
+; --- screen texts (GR.1/2: lower case letters show in colour 3) --------------
+TITLE                           ; 20 characters
+        .SBYTE "   sectorcopy "
+        .BYTE $51,$4E,$54,$00,$00,$00
+CREDIT                          ; "(P) 06/87  E.REUSS"
+        .BYTE $80
+        .SBYTE +$C0,"(P)"
+        .BYTE $80
+        .SBYTE +$C0,"06/87"
+        .BYTE $80,$80
+        .SBYTE +$C0,"E.REUSS"
+        .BYTE $80
+DASHES
+        .REPT 20
+        .BYTE $0D
+        .ENDR
+; status messages: MSGLMS shows the 20 characters from one of these labels
+MSGSETUP
+        .SBYTE +$80,"     einstellen "
+MSGFORMAT
+        .SBYTE +$80,"     formatieren   "
+MSGORIG
+        .SBYTE +$80,"  original diskette"
+MSGTARGET
+        .SBYTE +$80,"    ziel diskette  "
+MSGINSERT
+        .SBYTE +$80," disketten einlegen"
+MSGERROR                        ; error code goes to MSGERROR+$0F
+        .SBYTE +$80,"  disk fehler "
+        .BYTE $C3       ; "#"
+        .SBYTE +$80,"  "
+MSGSECTOR                       ; sector number goes to MSGERROR+$1E
+        .SBYTE +$80,"     sector         "
+
+; --------------------------------------------------------------------------
+; COLD START: screen setup, memory detection, drive detection
+; --------------------------------------------------------------------------
+COLDST
+        LDX #$FF
+        TXS
+        SEI
+        LDA #<DLIST
+        STA DLISTL
+        LDA #>DLIST
+        STA DLISTH
+        LDY #$04
+SETCOLORS
+        LDA COLORS,Y
+        STA COLPF0,Y
+        DEY
+        BPL SETCOLORS
+        STY LASTPASS
+        LDA #>MSGSETUP  ; all messages are in this page
+        STA MSGLMS+1
+        JSR CLRSCR
+        LDX #$04
+        STX RETRIES
+        LDA #$28
+SETSPEED
+        STA DRVSPD,X       ; all drives start at 19200 baud (POKEY divisor $28)
+        DEX
+        BNE SETSPEED
+        STX NOFMT         ; NOFMT = 0: "Formatieren: JA"
+        LDX #$80
+
+; Detect extended RAM (130XE / upgrades): write each bank's number to $4000
+; in all 16 PORTB bank settings, then count how many consecutive banks keep
+; their own number. Result: NUMBANKS = number of usable 16K banks.
+WAITVBL
+        LDA VCOUNT
+        BNE WAITVBL
+        DEX
+        BPL WAITVBL
+        STX BANKWIN
+        DEX
+        STX PORTB
+        LDY #$0F
+        STY NUMBANKS
+MARKBANK
+        LDY NUMBANKS
+        JSR SELBANK
+        STY BANKWIN
+        DEC NUMBANKS
+        BPL MARKBANK
+        LDA #$FE
+        STA PORTB
+        LDY #$00
+        STY TEMP
+        STY NUMBANKS
+        LDA BANKWIN
+        CMP #$FF
+        BNE FINDTOP
+COUNTBANK
+        LDY NUMBANKS
+        CPY #$10
+        BCS BANKSDONE
+        JSR SELBANK
+        LDA BANKWIN
+        CMP TEMP
+        BMI BANKSDONE
+        STA TEMP
+        INC NUMBANKS
+        JMP COUNTBANK
+BANKSDONE
+        LDA #$FE
+        STA PORTB
+        BNE FINDTOP
+SELBANK
+        LDA PORTB
+        AND #$23
+        ORA BANKTAB,Y
+        STA PORTB
+        RTS
+BANKTAB
+        .BYTE $CC,$C8,$C4,$C0,$8C,$88,$84,$80
+        .BYTE $4C,$48,$44,$40,$0C,$08,$04,$00
+
+; Find the top of main RAM: if $8000 / $A000 is not writable a cartridge is
+; there. RAMTOP = high byte where main memory ends ($80, $A0 or $C0).
+FINDTOP
+        LDA #$80
+        LDY $8000
+        INC $8000
+        CPY $8000
+        BEQ SETTOP
+        LDA #$A0
+        LDY $A000
+        INC $A000
+        CPY $A000
+        BEQ SETTOP
+        LDA #$C0
+SETTOP
+        STA RAMTOP
+        LDA #$01        ; look for the first drive from D1: up
+        JSR FINDDRIVE
+        BCC GOTSOURCE
+        JMP COLDST
+GOTSOURCE
+        STY SRCFAST         ; SRCFAST = $FF if source drive does high speed
+        LDA DUNIT
+        STA SRCDRV         ; SRCDRV = source drive number
+        ORA #$10
+        STA SRCDIGIT
+        LDX #$40
+        LDY #$00
+DRVDELAY
+        DEY
+        BNE DRVDELAY
+        DEX
+        BNE DRVDELAY
+        LDX DUNIT
+        INX             ; look for a second drive after the source
+        TXA
+        JSR FINDDRIVE
+        BCS ONEDRIVE
+        LDA DUNIT
+        BNE SETTARGET
+ONEDRIVE
+        LDA SRCDRV         ; none: target = source (copy with one drive)
+        LDY SRCFAST
+SETTARGET
+        STA DSTDRV         ; DSTDRV = target drive number
+        STY DSTFAST         ; DSTFAST = $FF if target drive does high speed
+        ORA #$10
+        STA DSTDIGIT
+
+; --------------------------------------------------------------------------
+; MAIN MENU
+; --------------------------------------------------------------------------
+MENU
+        JSR CLRSCR
+        LDY #$08
+        JSR PRINTI
+        .SBYTE "Original Laufwerk.... D"
+SRCDIGIT
+        .BYTE $11
+        NOP
+        LDY #$30
+        JSR PRINTI
+        .SBYTE "Ziel Laufwerk........ D"
+DSTDIGIT
+        .BYTE $11
+        NOP
+MENULOW
+        LDX #<MSGSETUP
+        STX MSGLMS
+        LDY #$78
+        JSR CLRSCRY
+        LDY #$5E
+        JSR PRINTI
+        .SBYTE "Speicher: "
+        NOP
+        LDA RAMTOP
+        AND #$60
+        LSR A
+        LSR A
+        LSR A
+        LDX NUMBANKS
+        CPX #$04
+        BCC MEMSIZE2
+        CLC
+        ADC #$0C
+MEMSIZE2
+        CPX #$08
+        BCC MEMSIZE3
+        CLC
+        ADC #$0C
+MEMSIZE3
+        CPX #$10
+        BCC MEMSIZE4
+        CLC
+        ADC #$0C
+MEMSIZE4
+        TAX
+        LDA #$04
+        STA TEMP
+MEMSIZELP
+        LDA MEMSIZES,X
+        STA SCREEN,Y
+        INY
+        INX
+        DEC TEMP
+        BNE MEMSIZELP
+        LDA LASTPASS
+        BNE OPTSWAP
+        LDY #$7D
+        JSR PRINTI
+        .BYTE $D9
+        .SBYTE +$80,"OPTION"
+        .BYTE $59
+        .SBYTE ".Von Ramdisk schreiben"
+        NOP
+        JMP OPTSELECT
+OPTSWAP
+        LDA SRCDRV
+        CMP DSTDRV
+        BEQ OPTSELECT
+        LDY #$7D
+        JSR PRINTI
+        .BYTE $D9
+        .SBYTE +$80,"OPTION"
+        .BYTE $59
+        .SBYTE ".Laufwerke austauschen"
+        NOP
+OPTSELECT
+        LDY #$A5
+        JSR PRINTI
+        .BYTE $D9
+        .SBYTE +$80,"SELECT"
+        .BYTE $59
+        .SBYTE ".....Formatieren: "
+        NOP
+        LDA NOFMT
+        BEQ FMTYES
+        JSR PRINTI
+        .SBYTE "NEIN"
+        NOP
+        BEQ OPTSTART
+FMTYES
+        JSR PRINTI
+        .SBYTE " JA "
+        NOP
+OPTSTART
+        LDY #$CD
+        JSR PRINTI
+        .BYTE $D9
+        .SBYTE +$80,"START"
+        .BYTE $59
+        .SBYTE "......Diskette kopieren"
+        NOP
+        JSR GETKEY      ; wait for START / SELECT / OPTION
+        CMP #$05
+        BEQ TOGGLEFMT   ; SELECT: toggle format
+        CMP #$06
+        BEQ STARTCOPY   ; START: copy disk
+        LDA LASTPASS
+        BEQ RAMWRITE    ; OPTION and the whole disk is in RAM: write again
+        LDY SRCDRV         ; OPTION otherwise: swap source and target drive
+        LDX DSTDRV
+        STY DSTDRV
+        STX SRCDRV
+        TYA
+        ORA #$10
+        STA DSTDIGIT
+        TXA
+        ORA #$10
+        STA SRCDIGIT
+        LDY SRCFAST
+        LDX DSTFAST
+        STY DSTFAST
+        STX SRCFAST
+        JMP MENU
+
+; --------------------------------------------------------------------------
+; OPTION "Von Ramdisk schreiben": the previous copy fit into memory in one
+; pass, so the image is still there. Restore the saved progress line and
+; jump straight into the write phase to make another copy.
+; --------------------------------------------------------------------------
+RAMWRITE
+        LDY #$CB
+        STY WBARPOS
+        LDX #$FF
+        STX WPASS         ; WPASS = $FF: no write pass done yet
+        INX
+        STX WBARQ
+        STX WBARCNT
+        STX TWODRV         ; TWODRV = 0: prompt for the target disk
+        STX TGTFMTD         ; TGTFMTD = 0: target not formatted yet
+        LDY #$78
+        JSR CLRSCRY
+        LDY #$78
+RESTBARS
+        LDA SAVEDBARS,X
+        STA SCREEN,Y
+        INX
+        INY
+        CPY #$C8
+        BNE RESTBARS
+        LDA #$37
+        STA WBARTEXT
+        JMP READDONE
+TOGGLEFMT
+        LDA NOFMT
+        EOR #$FF
+        STA NOFMT
+        JMP MENULOW
+
+; --------------------------------------------------------------------------
+; START: COPY A DISK
+; The disk is copied in passes. Each pass reads as many sectors as fit into
+; the buffer (main RAM $0400-, then $C000-$CFFF, $D800-$EFFF, then the
+; extended RAM banks at $4000-$7FFF), then writes them to the target.
+; With only one drive the user swaps original and target disk each pass.
+; --------------------------------------------------------------------------
+STARTCOPY
+        LDA SRCDRV
+        EOR DSTDRV
+        STA TWODRV         ; TWODRV = 0: source and target are the same drive
+        LDY #$06
+        LDA #$00
+        STA SLOWFLG         ; SLOWFLG = 0: high speed fallback not used yet
+        STA TGTFMTD         ; TGTFMTD = 0: target not formatted yet
+CLRBARS
+        STA RBARPOS,Y     ; clear both progress bar counters RBARPOS-WBARCNT
+        DEY
+        BPL CLRBARS
+        STY WPASS         ; WPASS = $FF: no write pass done yet
+        LDA #$A3
+        STA RBARPOS         ; read progress bar: screen position
+        LDA #$CB
+        STA WBARPOS         ; write progress bar: screen position
+        LDY #$78
+        JSR CLRSCRY
+        LDA #$32
+        STA RBARTEXT    ; "R" in front of the read progress bar
+        LDA #$37
+        STA WBARTEXT    ; "W" in front of the write progress bar
+        STA RETRIES         ; SIO retries = 55
+        LDX #$01
+        STX SECTOR         ; start with sector 1
+        DEX
+        STX SECTOR+1
+
+; Start of a pass: ask for the disk(s) and wait for START.
+NEXTPASS
+        LDA TWODRV
+        BEQ PROMPT1DRV
+        LDX #<MSGINSERT ; "DISKETTEN EINLEGEN" (two drives)
+        LDA #$20
+PROMPT
+        STX MSGLMS      ; select the message line in the display list
+        LDA #$20
+        JSR BEEPKEY     ; beep, wait for a console key
+        CMP #$06
+        BEQ CHKDENS
+        JMP MENULOW     ; anything but START: back to the menu
+PROMPT1DRV
+        LDX #<MSGORIG   ; "ORIGINAL DISKETTE" (one drive)
+        BNE PROMPT
+CHKDENS
+        LDA WPASS
+        BMI GETDENS     ; density is only checked in the first pass
+        JMP READPASS
+
+; First pass: send STATUS ($53) to the source drive and work out the density
+; from the status byte: bit 7 = medium (enhanced), bit 5 = double.
+; DENSITY = density ($00 single, $20 double, $80 medium),
+; SECSTEP = sectors per progress bar step.
+GETDENS
+        LDA #$53        ; command $53 STATUS, 4 bytes into $0400
+        STA DCOMND
+        LDA #$04
+        STA DBYT
+        LDA #$40
+        STA DSTATS
+        JSR BUFRESET
+        LDY SRCDRV
+        JSR SIOSLOW
+        LDY #$85
+        JSR PRINTI
+        .SBYTE "Density:  "
+        NOP
+        LDA SECBUF
+        AND #$A0
+        STA DENSITY
+        AND #$80
+        BNE DENSMED
+        LDA #$05
+        STA SECSTEP
+        LDA SECBUF
+        AND #$20
+        BNE DENSDBL
+        STA DENSITY
+        JSR PRINTI
+        .SBYTE "SINGLE"
+        NOP
+        JMP PREFORMAT
+DENSMED
+        LDX #$08
+        STX SECSTEP
+        JSR PRINTI
+        .SBYTE "MEDIUM"
+        NOP
+        BEQ PREFORMAT
+DENSDBL
+        JSR PRINTI
+        .SBYTE "DOUBLE"
+        NOP
+PREFORMAT
+        LDA TWODRV         ; two drives, format enabled and a high speed
+        BEQ READPASS    ; target drive: format the target now, while
+        LDA NOFMT         ; the first pass is read from the source
+        BNE READPASS
+        BIT DSTFAST
+        BPL READPASS
+        JSR SENDPERCOM  ; send the density (PERCOM block) to the target
+        SEC
+        JSR SENDCMD44   ; drive specific command $44, aux $10
+        TYA
+        BMI READPASS
+PREFMTCMD
+        LDA #$20        ; command $20: format (high speed drive)
+        STA DCOMND
+        LDA #$00        ; no data frame
+        STA DSTATS
+        LDY DSTDRV
+        JSR SIOSLOW
+        TYA
+        BPL PREFMTOK
+        JSR DISKERR
+        BCC PREFMTCMD
+        JMP MENULOW
+PREFMTOK
+        INC TGTFMTD         ; TGTFMTD <> 0: target is formatted
+
+; --------------------------------------------------------------------------
+; READ PHASE: read sectors from the source drive into the buffer, starting
+; at the current sector (SECTOR), until the disk ends or memory is full.
+; --------------------------------------------------------------------------
+READPASS
+        LDA SECTOR         ; remember first sector of this pass in PASSSEC
+        STA PASSSEC
+        LDA SECTOR+1
+        STA PASSSEC+1
+        LDY SRCDRV
+        STY DUNIT         ; unit = source drive
+        BIT SLOWFLG         ; after a read error the source drive stays at
+        BPL READSTART
+        LDA #$28        ; normal speed for the rest of the copy
+        STA DRVSPD,Y
+READSTART
+        JSR BUFRESET    ; buffer pointer to $0400, main memory
+READLOOP
+        LDX RBARPOS
+        LDY RBARQ
+        LDA RBARCNT
+        JSR PROGRESS    ; advance the read progress bar
+        STA RBARCNT
+        STY RBARQ
+        STX RBARPOS
+READSECT
+        LDX #<MSGSECTOR ; show "SECTOR" line
+        STX MSGLMS
+        LDA #$40        ; direction: receive data
+        STA DSTATS
+        LDA SECTOR         ; aux = sector number
+        STA DAUX
+        LDA SECTOR+1
+        STA DAUX+1
+        LDA #$52        ; command $52: READ SECTOR
+        STA DCOMND
+        JSR SETLEN      ; byte count (128/256), show sector number
+        JSR SIOTRY2     ; do the SIO call (2 tries)
+        BCC READNEXT    ; ok: next sector
+        BIT SLOWFLG         ; already at normal speed: report the error
+        BPL SLOWDOWN
+        JSR DISKERR     ; "DISK FEHLER #xx", wait for a key
+        CMP #$06
+        BEQ READSECT    ; START: try again
+        CMP #$05
+        BEQ READNEXT    ; SELECT: skip this sector
+        JMP MENULOW     ; OPTION: abort, back to the menu
+
+; First read error: fall back from high speed to normal speed (19200 baud)
+; for the source drive and retry. The old divisor is kept in SAVSPD.
+SLOWDOWN
+        LDY DUNIT
+        LDA DRVSPD,Y
+        STA SAVSPD
+        LDA #$28
+        STA DRVSPD,Y
+        DEC SLOWFLG
+        BNE READSECT
+READNEXT
+        JSR NEXTSECT    ; next sector / buffer address
+        BCC READLOOP    ; loop until disk end or buffer full
+
+; --------------------------------------------------------------------------
+; Read phase done. NEXTSEC = sector where the next pass will continue.
+; With one drive, ask for the target disk.
+; --------------------------------------------------------------------------
+READDONE
+        LDA SECTOR
+        STA NEXTSEC
+        LDA SECTOR+1
+        STA NEXTSEC+1
+        LDA TWODRV
+        BNE WRITEPASS
+        LDX #<MSGTARGET ; "ZIEL DISKETTE"
+        STX MSGLMS
+        LDA #$20
+        JSR BEEPKEY     ; beep, wait for a key
+        CMP #$05        ; START (6) or SELECT (5): send drive specific
+        BCC CHKABORT
+        LSR A           ; command $44 with aux $30 (START) or $10 (SELECT)
+        JSR SENDCMD44
+        JMP WRITEPASS
+CHKABORT
+        CMP #$03        ; OPTION: abort
+        BNE WRITEPASS
+        JMP MENULOW
+
+; --------------------------------------------------------------------------
+; WRITE PHASE: write the buffer to the target drive, starting again at the
+; first sector of this pass.
+; --------------------------------------------------------------------------
+WRITEPASS
+        LDA PASSSEC         ; back to the first sector of this pass
+        STA SECTOR
+        LDA PASSSEC+1
+        STA SECTOR+1
+        LDA DSTDRV
+        STA DUNIT         ; unit = target drive
+        BIT SLOWFLG
+        BPL CHKFORMAT
+        LDY SRCDRV         ; source fell back to normal speed: put its
+        LDA SAVSPD         ; high speed divisor back
+        STA DRVSPD,Y
+CHKFORMAT
+        LDA WPASS         ; format only before the first write pass,
+        BPL WRITESTART
+        LDA TGTFMTD         ; if not already formatted during reading
+        BNE WRITESTART
+        LDA NOFMT         ; and if "Formatieren: JA"
+        BNE WRITESTART
+
+; Format the target disk in the density of the source:
+; $21 = single/double (128/256 byte status), $22 = medium.
+FORMAT
+        LDX #<MSGFORMAT ; "FORMATIEREN"
+        STX MSGLMS
+        LDA DSTFAST
+        BPL FMTSETCMD   ; high speed target: set density (PERCOM) first
+        JSR SENDPERCOM
+FMTSETCMD
+        LDA #$80
+        STA DBYT
+        LDA #$22        ; command $22: format medium density
+        BIT DENSITY
+        BMI FMTSEND
+        LDA #$80
+        STA DBYT
+        LDA DENSITY
+        BEQ FMTSD
+        BMI FMTSD
+        ASL DBYT
+FMTSD
+        LDA #$21        ; command $21: format single / double
+FMTSEND
+        STA DCOMND
+        LDA #$D5        ; bad sector list goes to $D500
+        STA DBUF+1
+        LDA #$40
+        STA DSTATS
+        LDY DSTDRV
+        JSR SIOSLOW     ; SIO call at normal speed
+        TYA
+        BPL WRITESTART
+        JSR DISKERR     ; error: "DISK FEHLER", retry
+        BCC FORMAT
+        JMP MENULOW
+WRITESTART
+        LDA #$50        ; command $50: PUT SECTOR (write, no verify)
+        STA DCOMND
+        INC WPASS         ; count the write pass
+        JSR BUFRESET    ; buffer pointer back to $0400, main memory
+WRITESECT
+        LDX #<MSGSECTOR
+        STX MSGLMS
+        LDA #$80        ; direction: send data
+        STA DSTATS
+        LDA SECTOR         ; aux = sector number
+        STA DAUX
+        LDA SECTOR+1
+        STA DAUX+1
+        JSR SETLEN      ; byte count (128/256), show sector number
+        JSR ISEMPTY     ; freshly formatted and sector all zero:
+        BCS WRITENEXT   ; nothing to write, skip it
+        JSR SIOTRY2     ; do the SIO call (2 tries)
+        BCC WRITENEXT
+        JSR DISKERR     ; error: "DISK FEHLER", wait for a key
+        BCC WRITESECT
+        JMP MENULOW
+WRITENEXT
+        LDX WBARPOS
+        LDY WBARQ
+        LDA WBARCNT
+        JSR PROGRESS    ; advance the write progress bar
+        STA WBARCNT
+        STY WBARQ
+        STX WBARPOS
+        JSR NEXTSECT    ; next sector / buffer address
+        BCC WRITESECT   ; loop until disk end or buffer full
+        PHP             ; Z set = disk end, clear = buffer full
+        LDA DSTFAST
+        BPL PASSDONE
+        LDA #$51        ; high speed target: command $51 (flush the
+        STA DCOMND
+        LDA #$00        ; drive's write buffer)
+        STA DSTATS
+        LDY DSTDRV
+        JSR SIOSLOW
+PASSDONE
+        PLP
+        BEQ COPYDONE    ; whole disk copied
+        LDA NEXTSEC         ; buffer was full: next pass continues at NEXTSEC
+        STA SECTOR
+        LDA NEXTSEC+1
+        STA SECTOR+1
+        LDA TWODRV
+        BNE NEXTPASS2
+        JMP NEXTPASS    ; one drive: ask for the original disk again
+NEXTPASS2
+        JMP READPASS    ; two drives: read the next part right away
+
+; --------------------------------------------------------------------------
+; Send the 12 byte PERCOM configuration block for the density in DENSITY to the
+; target drive (command $4F). Tables PCSINGLE, PCDOUBLE,
+; PCMEDIUM.
+; --------------------------------------------------------------------------
+SENDPERCOM
+        LDA DENSITY
+        BEQ SELPCSD
+        BPL SELPCDD
+        LDX #<PCMEDIUM
+        LDY #>PCMEDIUM
+        BNE PERCOMSEND
+SELPCDD
+        LDX #<PCDOUBLE
+        LDY #>PCDOUBLE
+        BNE PERCOMSEND
+SELPCSD
+        LDX #<PCSINGLE
+        LDY #>PCSINGLE
+PERCOMSEND
+        STX DBUF
+        STY DBUF+1
+        LDA #$4F
+        STA DCOMND
+        LDA #$0C
+        STA DBYT
+        LDA #$80
+        STA DSTATS
+        LDY DSTDRV
+        JMP SIOSLOW
+
+; Send drive specific command $44 to the target, aux1 = $10 (C=1) or $30
+; (C=0), no data frame.
+SENDCMD44
+        LDA #$10
+        BCS CMD44AUX
+        ORA #$20
+CMD44AUX
+        STA DAUX
+        LDA #$00
+        STA DSTATS
+        LDA #$44
+        STA DCOMND
+        LDY DSTDRV
+        JMP SIOSLOW
+
+; --------------------------------------------------------------------------
+; Copy finished: save the progress line (for "Von Ramdisk schreiben"),
+; remember in LASTPASS whether one pass was enough (LASTPASS = 0), play a sound and
+; return to the menu.
+; --------------------------------------------------------------------------
+COPYDONE
+        LDY #$78
+        LDX #$00
+SAVEBARLP
+        LDA SCREEN,Y
+        STA SAVEDBARS,X
+        INX
+        INY
+        CPY #$C8
+        BNE SAVEBARLP
+        LDA WPASS
+        STA LASTPASS
+        LDA #$00
+        STA AUDCTL
+        LDY #$EF
+DONESOUND
+        STY AUDC1
+        STY TEMP
+        JSR SWEEP
+        LDY TEMP
+        DEY
+        CPY #$DF
+        BNE DONESOUND
+        JMP MENULOW
+SWEEP
+        LDX #$08
+SWEEPLP
+        STX AUDF1
+        LDY #$00
+SWEEPDLY
+        DEY
+        BNE SWEEPDLY
+        INX
+        CPX #$50
+        BNE SWEEPLP
+        RTS
+
+; --------------------------------------------------------------------------
+; Set the byte count for sector DAUX: 128 bytes, or 256 for double
+; density sectors 4 and up (sectors 1-3 are always 128 bytes). Also shows
+; the sector number on the "SECTOR" line.
+; --------------------------------------------------------------------------
+SETLEN
+        LDA #$80
+        STA DBYT
+        LDA #$00
+        STA DBYT+1
+        LDY #$1E
+        LDA DAUX+1
+        JSR PUTHEX1
+        LDA DAUX
+        JSR PUTHEX2
+        LDA DENSITY
+        CMP #$20
+        BNE SETLENX
+        LDA DAUX+1
+        BNE LEN256
+        LDA DAUX
+        CMP #$04
+        BCC SETLENX
+LEN256
+        ASL DBYT
+        ROL DBYT+1
+SETLENX
+        RTS
+
+; --------------------------------------------------------------------------
+; SIO call with the drive's current speed, tried twice.
+; Out: C = 0 ok, C = 1 error (Y and DSTATS = status).
+; --------------------------------------------------------------------------
+SIOTRY2
+        LDA #$02
+        STA TEMP
+        LDA DSTATS
+        STA SAVDIR
+SIOTRYLP
+        JSR SIO
+        BPL SIOTRYOK
+        LDA SAVDIR
+        STA DSTATS
+        DEC TEMP
+        BNE SIOTRYLP
+        STY DSTATS
+        SEC
+        RTS
+SIOTRYOK
+        CLC
+        RTS
+
+; --------------------------------------------------------------------------
+; SIO call to unit Y at normal speed (19200 baud): the drive's high speed
+; divisor is set to $28 for this call and restored afterwards. Used for
+; commands that only work at normal speed (status, format, config).
+; --------------------------------------------------------------------------
+SIOSLOW
+        STY DUNIT
+        LDA DRVSPD,Y
+        PHA
+        LDA #$28
+        STA DRVSPD,Y
+        JSR SIOTRY2
+        LDX DUNIT
+        PLA
+        STA DRVSPD,X
+        RTS
+
+; --------------------------------------------------------------------------
+; Advance to the next sector and buffer position.
+; Last sector is 720 ($2D0), or 1040 ($410) for medium density.
+; The buffer pointer DBUF moves up by the byte count and skips over the
+; memory that cannot be used:
+;   main RAM $0400 up to RAMTOP (cartridge), $C000-$CFFF, $D800-$EFFF,
+;   then the extended RAM banks one by one at $4000-$7FFF.
+; Out: C = 0           ok, continue
+;      C = 1, Z = 1    last sector of the disk done
+;      C = 1, A = $FF  buffer full, copy needs another pass
+; --------------------------------------------------------------------------
+NEXTSECT
+        BIT DENSITY
+        BPL CHKEND720
+        LDA SECTOR
+        CMP #$10
+        BNE INCSECT
+        LDA SECTOR+1
+        CMP #$04
+        BNE INCSECT
+        SEC
+        RTS
+CHKEND720
+        LDA SECTOR
+        CMP #$D0
+        BNE INCSECT
+        LDA SECTOR+1
+        CMP #$02
+        BNE INCSECT
+        SEC
+        RTS
+INCSECT
+        INC SECTOR
+        BNE NEXTBUF
+        INC SECTOR+1
+NEXTBUF
+        LDA DBUF
+        CLC
+        ADC DBYT
+        STA DBUF
+        LDA DBUF+1
+        ADC DBYT+1
+        STA DBUF+1
+        BIT BANKFLG         ; already in the extended banks?
+        BMI INBANKS
+        TAY
+        INY
+        CPY #$F1        ; reached $F000: main memory is full
+        BEQ MAINFULL
+        CPY #$D1        ; reached $D000: skip the I/O area to $D800
+        BEQ SKIPIO
+        CPY RAMTOP         ; reached cartridge area: continue at $C000
+        BNE BUFOK
+        LDA #$C0
+        STA DBUF+1
+        LDA #$00
+        STA DBUF
+BUFOK
+        CLC
+        BCC BUFRET
+SKIPIO
+        LDA #$00
+        STA DBUF
+        LDA #$D8
+        STA DBUF+1
+        CLC
+        BCC BUFRET
+MAINFULL
+        LDA NUMBANKS         ; no extended RAM: buffer full
+        BNE USEBANKS
+BUFFULL
+        SEC
+BUFRET
+        LDA #$FF
+        RTS
+
+; Switch over to the first extended bank, buffer at $4000.
+USEBANKS
+        LDY #$FF
+        STY BANKFLG         ; BANKFLG = $FF: now using the banks
+        INY
+        STY CURBANK         ; CURBANK = current bank
+SETBANK
+        LDA PORTB
+        AND #$23
+        ORA BANKTAB,Y
+        STA PORTB
+        LDA #$00
+        STA DBUF
+        LDA #$40
+        STA DBUF+1
+        CLC
+        BCC BUFRET
+INBANKS
+        CMP #$80        ; end of the bank window ($8000)?
+        BCC BUFRET
+        INC CURBANK
+        LDY CURBANK
+        CPY NUMBANKS
+        BEQ BUFFULL     ; all banks used: buffer full
+        BNE SETBANK
+
+; --------------------------------------------------------------------------
+; Buffer pointer DBUF = $0400 in main memory, extended banks off.
+; --------------------------------------------------------------------------
+BUFRESET
+        LDA #$00
+        STA DBUF
+        LDA #$04
+        STA DBUF+1
+        LDA #$00
+        STA BANKFLG
+        LDA PORTB
+        ORA #$10
+        STA PORTB
+        RTS
+
+; --------------------------------------------------------------------------
+; Show "DISK FEHLER #xx" with the SIO status, beep and wait for a console
+; key (A = CONSOL: 6 START, 5 SELECT, 3 OPTION).
+; --------------------------------------------------------------------------
+DISKERR
+        LDX #<MSGERROR
+        STX MSGLMS
+        LDY #$0F
+        LDA DSTATS
+        JSR PUTHEX2
+        LDA #$80
+        JSR BEEPKEY
+        BEQ DISKERRC
+        SEC
+        RTS
+DISKERRC
+        CLC
+        RTS
+
+; Write A as two hex digits / A as one hex digit into the message lines
+; at $F4C8+Y.
+PUTHEX2
+        PHA
+        LSR A
+        LSR A
+        LSR A
+        LSR A
+        JSR PUTHEX1
+        PLA
+        AND #$0F
+PUTHEX1
+        CMP #$0A
+        BCC PUTHEXD
+        ADC #$06
+PUTHEXD
+        ADC #$D0
+        STA MSGERROR,Y
+        INY
+        RTS
+
+; --------------------------------------------------------------------------
+; Progress bar: count sectors in A, every SECSTEP sectors the bar character at
+; screen line position X grows by a quarter (Y = 0..3).
+; In/out: X = position, Y = quarter, A = sector count.
+; --------------------------------------------------------------------------
+PROGRESS
+        STY PROGTMP
+        TAY
+        INY
+        CPY SECSTEP
+        BCC PROGRET
+        LDY PROGTMP
+        INY
+        CPY #$04
+        BCC PROGDRAW
+        INX
+        LDY #$00
+PROGDRAW
+        LDA BARCHARS,Y
+        STA SCREEN,X
+        LDA #$00
+        RTS
+PROGRET
+        TYA
+        LDY PROGTMP
+        RTS
+BARCHARS                           ; progress bar: 1/4 .. 4/4 filled
+        .BYTE $56,$59,$C2,$80
+COLORS                           ; COLPF0-COLPF3, COLBK
+        .BYTE $FA,$8A,$10,$CA,$10
+MEMSIZES                        ; 4 characters per entry, see MENULOW
+        .SBYTE "40k 48k 56k 104k112k120k168k176k"
+        .SBYTE "184k296k304k312k"
+
+; PERCOM configuration blocks, sent to a high speed target before formatting:
+;       tracks,step,sectors/track (hi,lo),sides-1,density (0 FM, 4 MFM),
+;       bytes/sector (hi,lo),drive present,3 unused
+PCSINGLE
+        .BYTE 40,0,0,18,0,0,0,128,$FF,0,0,0
+PCDOUBLE
+        .BYTE 40,0,0,18,0,4,1,0,$FF,0,0,0
+PCMEDIUM
+        .BYTE 40,0,0,26,0,4,0,128,$FF,0,0,0
+
+; --------------------------------------------------------------------------
+; C = 1 if the target was formatted ("Formatieren: JA") and the sector in
+; the buffer is all zero, so it need not be written.
+; --------------------------------------------------------------------------
+ISEMPTY
+        LDA NOFMT
+        BNE NOTEMPTY
+        LDA DBUF
+        STA EMPTYLP+1
+        LDA DBUF+1
+        STA EMPTYLP+2
+        LDY #$00
+EMPTYLP
+        LDA $AAAA,Y     ; address patched above
+        BNE NOTEMPTY
+        INY
+        CPY DBYT
+        BNE EMPTYLP
+        SEC
+        RTS
+NOTEMPTY
+        CLC
+        RTS
+PRINTI
+        PLA
+        STA PRPTR
+        PLA
+        STA PRPTR+1
+PRINTLP
+        INC PRPTR
+        BNE PRINTCH
+        INC PRPTR+1
+PRINTCH
+        LDX #$00
+        LDA (PRPTR,X)
+        CMP #$EA
+        BEQ PRINTRET
+        STA SCREEN,Y
+        INY
+        BNE PRINTLP
+PRINTRET
+        JMP (PRPTR)
+CLRSCR
+        LDY #$00
+CLRSCRY
+        LDA #$00
+CLRSCRLP
+        STA SCREEN,Y
+        INY
+        CPY #$F0
+        BNE CLRSCRLP
+        RTS
+BEEPKEY
+        STA AUDF1
+        LDY #$EF
+BEEPLP
+        LDX #$FF
+BEEPDLY
+        STX WSYNC
+        DEX
+        BNE BEEPDLY
+        DEY
+        STY AUDC1
+        CPY #$E0
+        BNE BEEPLP
+        JSR GETKEY
+        RTS
+GETKEY
+        LDA CONSOL
+        CMP #$07
+        BNE GETKEY
+        LDX #$00
+KEYDEBNC
+        DEX
+        STX WSYNC
+        BNE KEYDEBNC
+KEYWAIT
+        LDA CONSOL
+        CMP #$07
+        BEQ KEYWAIT
+        LDY #$40
+KEYCLICK
+        STA WSYNC
+        STY CONSOL
+        DEY
+        BNE KEYCLICK
+        STY ATRACT
+        RTS
+
+; --------------------------------------------------------------------------
+; Find a drive, starting at unit A (up to D4:). Sends command $3F (ask for
+; the high speed index) and stores the answer as the drive's POKEY divisor.
+; Out: C = 1 no drive found
+;      C = 0, DUNIT = unit, Y = $FF high speed drive, Y = 0 normal drive
+; --------------------------------------------------------------------------
+FINDDRIVE
+        STA DUNIT
+        LDA #$3F        ; command $3F: get high speed index, 1 byte
+        STA DCOMND
+        LDX #$00
+        INX
+        STX DBYT
+        LDA #$40
+        STA DSTATS
+        JSR BUFRESET
+        JSR SIO
+        TYA
+        BPL DRVFAST
+        CMP #$8B        ; NAK: a drive without high speed
+        BEQ DRVNORMAL
+        INC DUNIT
+        LDA DUNIT
+        CMP #$05
+        BCC FINDDRIVE
+        SEC
+        RTS
+DRVNORMAL
+        LDY #$00
+        CLC
+        RTS
+DRVFAST
+        LDA SECBUF
+        LDY DUNIT
+        STA DRVSPD,Y     ; high speed POKEY divisor for this drive
+        LDY #$FF
+        CLC
+        RTS
+
+; --------------------------------------------------------------------------
+; SIO: own implementation of the serial bus protocol (the OS is gone).
+; Parameters like the OS device control block, in zero page:
+;   DUNIT unit   DCOMND command   DSTATS direction ($40 receive, $80 send)
+;   DBUF buffer   DBYT byte count   DAUX aux (sector number)
+; Speed per drive in DRVSPD+unit (POKEY divisor, $28 = 19200 baud).
+; Out: Y = DSTATS = status ($01 ok, $8A timeout/checksum, $8B NAK, $90 error)
+; Errors restore the stack from SIOSTK and retry from SIORETRY, RETRIES times.
+; --------------------------------------------------------------------------
+SIO
+        LDY DUNIT
+        TYA
+        ORA #$30
+        STA CMDFRM       ; command frame at CMDFRM: device $31+unit,
+        LDA DCOMND
+        STA CMDFRM+1       ; command,
+        LDA DAUX
+        STA CMDFRM+2       ; aux1,
+        LDA DAUX+1
+        STA CMDFRM+3       ; aux2
+        LDA DRVSPD,Y
+        STA AUDF3       ; serial clock for this drive
+        LDA #$00
+        STA AUDF4
+        TSX
+        STX SIOSTK       ; stack pointer for error exit
+        LDA RETRIES
+        STA RETRY         ; retry counter
+SIORETRY
+        LDA #$00
+        STA SIOSTAT
+        STA NORETRY
+        LDA #<CMDFRM
+        STA FRMPTR
+        LDA #>CMDFRM
+        STA FRMPTR+1
+        LDA #$04
+        STA FRMLEN
+        LDA #$34        ; PBCTL $34: command line low
+        STA PBCTL
+        JSR SENDFRAME   ; send the 4 byte command frame
+        LDA DBUF
+        STA FRMPTR
+        LDA DBUF+1
+        STA FRMPTR+1
+        LDA DBYT
+        STA FRMLEN
+        BIT DSTATS
+        BPL SIOCOMPL    ; sending: also send the data frame
+        JSR SENDFRAME
+SIOCOMPL
+        DEC NORETRY       ; from here on no retry after an error
+        JSR WAITCOMPL   ; wait for "complete"
+        BIT DSTATS
+        BVC SIOEXIT     ; receiving: read the data frame
+        JSR RECVFRAME
+SIOEXIT
+        LDA #$A0
+        STA AUDC4
+        LDA POKMSK
+        STA IRQEN
+        JSR TIMSTOP
+        LDY SIOSTAT
+        STY DSTATS
+        RTS
+
+; Send a frame (FRMPTR = data, FRMLEN = length) plus checksum, then wait for
+; the drive's ACK.
+SENDFRAME
+        LDX #$FF
+SENDDLY
+        DEX
+        BNE SENDDLY
+        LDA #$23
+        JSR SERINIT
+        LDY #$00
+        LDA (FRMPTR),Y
+        STA CHKSUM
+        STA SEROUT
+SENDLP
+        INY
+        CPY FRMLEN
+        BEQ SENDSUM
+        LDA (FRMPTR),Y
+        JSR PUTBYTE
+        JSR ADDSUM
+        JMP SENDLP
+SENDSUM
+        LDA CHKSUM
+        JSR PUTBYTE
+SENDWAIT
+        LDA IRQST
+        AND #$08
+        BNE SENDWAIT
+        LDX #$00
+        LDY #$03
+        JSR TIMSET
+        LDA #$C0
+        STA IRQEN
+        JMP WAITACK
+
+; Receive a data frame (FRMPTR, FRMLEN bytes) and compare the checksum.
+RECVFRAME
+        LDA #$00
+        STA CHKSUM
+        LDY #$00
+RECVLP
+        JSR GETBYTE
+        STA (FRMPTR),Y
+        JSR ADDSUM
+        INY
+        CPY FRMLEN
+        BNE RECVLP
+        JSR GETBYTE
+        CMP CHKSUM
+        BNE SIOTMOUT
+        RTS
+
+; Error exit (also the timeout handler): status $8A, retry if allowed.
+SIOTMOUT
+        LDA #$8A
+SIOERROR
+        STA SIOSTAT
+        LDX SIOSTK
+        TXS
+        BIT NORETRY
+        BMI SIOGIVEUP
+        DEC RETRY
+        BEQ SIOGIVEUP
+        JMP SIORETRY
+SIOGIVEUP
+        JMP SIOEXIT
+
+; Wait for "complete" after a command; format commands (< $50) get a long
+; timeout. 'A'/'C' = ok, 'E' = device error ($90), else NAK ($8B).
+WAITCOMPL
+        LDX DCOMND
+        CPX #$50
+        BCS SHORTTMO
+        LDX #$0A
+        BNE STARTTMO
+SHORTTMO
+        LDX #$01
+STARTTMO
+        LDY #$60
+        JSR TIMSET
+WAITACK
+        LDA #$13
+        JSR SERINIT
+        LDA #$3C        ; PBCTL $3C: command line high
+        STA PBCTL
+        JSR GETBYTE
+        CMP #$41
+        BEQ TIMSTOP
+        CMP #$43
+        BEQ TIMSTOP
+        CMP #$45
+        BEQ DEVERROR
+        LDA #$8B
+        BNE SIOERROR
+DEVERROR
+        LDA #$90
+        STA SIOSTAT
+
+; Stop the timeout timer / start it with X*256+Y frames. On expiry the NMI
+; handler jumps through TIMVEC to SIOTMOUT (timeout error).
+TIMSTOP
+        LDY #$00
+        LDX #$00
+TIMSET
+        LDA #<SIOTMOUT  ; timer expiry vector -> timeout error
+        STA TIMVEC
+        LDA #>SIOTMOUT
+        STA TIMVEC+1
+        TXA
+        LDX #$03
+TIMSETLP
+        STA WSYNC
+        DEX
+        BNE TIMSETLP
+        STA TIMER+1
+        STY TIMER
+        RTS
+
+; Add A to the frame checksum CHKSUM (with end around carry).
+ADDSUM
+        CLC
+        ADC CHKSUM
+        ADC #$00
+        STA CHKSUM
+        RTS
+
+; Wait for and return one received byte; framing/overrun error -> SIOTMOUT.
+GETBYTE
+        LDA IRQST
+        AND #$20
+        BNE GETBYTE
+        LDA #$DF
+        STA IRQEN
+        LDA #$F8
+        STA IRQEN
+        LDA SKSTAT
+        STA SKRES
+        BPL GETBYTEERR
+        AND #$20
+        BEQ GETBYTEERR
+        LDA SERIN
+        RTS
+GETBYTEERR
+        JMP SIOTMOUT
+
+; Send one byte as soon as POKEY is ready.
+PUTBYTE
+        PHA
+PUTBYTELP
+        LDA IRQST
+        AND #$10
+        BNE PUTBYTELP
+        LDA #$EF
+        STA IRQEN
+        LDA #$F8
+        STA IRQEN
+        PLA
+        STA SEROUT
+        RTS
+
+; Set SKCTL serial mode A, POKEY channels 3+4 joined as baud rate clock.
+SERINIT
+        STA SKCTL
+        STA SKRES
+        LDA #$28
+        STA AUDCTL
+        LDA #$A8
+        STA AUDC4
+        LDA #$F8
+        STA IRQEN
+        RTS
+
+; --------------------------------------------------------------------------
+; NMI: RESET key restarts via $0100, VBI counts down the SIO timeout timer.
+; --------------------------------------------------------------------------
+NMI
+        PHA
+        LDA NMIST
+        AND #$20
+        BEQ NMIVBI
+        JMP RESTART
+NMIVBI
+        TXA
+        PHA
+        TYA
+        PHA
+        STA NMIRES
+        LDY TIMER
+        BNE TIMDEC
+        LDY TIMER+1
+        BEQ NMIEXIT
+        DEC TIMER+1
+TIMDEC
+        DEC TIMER
+        BNE NMIEXIT
+        LDY TIMER+1
+        BNE NMIEXIT
+        JSR TIMEXPIRED
+NMIEXIT
+        LDA #$08
+        STA CONSOL
+        PLA
+        TAY
+        PLA
+        TAX
+        PLA
+        RTI
+TIMEXPIRED
+        JMP (TIMVEC)
+IRQ
+        PHA
+        LDA IRQST
+        EOR #$FF
+        STA IRQEN
+        LDA #$00
+        STA IRQEN
+        PLA
+        RTI
+SCREEN
+        .REPT 161
+        .BYTE $00
+        .ENDR
+RBARTEXT
+        .REPT 40
+        .BYTE $00
+        .ENDR
+WBARTEXT
+        .REPT 39
+        .BYTE $00
+        .ENDR
+SAVEDBARS
+        .REPT 142
+        .BYTE $00
+        .ENDR
+        .WORD NMI       ; $FFFA NMI vector
+        .WORD $0000     ; $FFFC RESET vector (unused)
+        .WORD IRQ       ; $FFFE IRQ vector

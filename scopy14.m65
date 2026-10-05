@@ -1,0 +1,139 @@
+; SCOPY14.COM - "sectorcopy" for Atari 8-bit computers
+; Disassembled with radare2 (gen.py), reassembles with ATasm 1.06.
+; Original by Erwin Reuss, Compyshop 06/87
+; (c) ABBUC e.V. 2026 (https://abbuc.de)
+; Licensed under GPLv2
+;
+; Build:
+;   atasm -r -oscopy14rom.bin scopy14rom.m65   ; resident part ($F000-$FFFF)
+;   atasm -oSCOPY14.NEW scopy14.m65            ; Atari DOS binary file
+;
+; The file is a single segment $2F00-$3FFF without RUN/INIT vector:
+;   $2F00  loader: copies the ROM character set ($E000-$E3FF) to $3000,
+;          switches the OS ROM off and moves $3000-$3FFF to RAM at
+;          $F000-$FFFF, then copies STUB to $0100 and runs it there.
+;   $2F60  STUB (runs at $0100): clears hardware, sets up ANTIC/POKEY
+;          and jumps into the resident program.
+;   $3000  resident program, assembled for $F000 (scopy14rom.m65).
+
+HPOSP0  = $D000
+AUDF1   = $D200
+SKCTL   = $D20F
+PORTB   = $D301
+DMACTL  = $D400
+CHACTL  = $D401
+CHBASE  = $D409
+NMIEN   = $D40E
+NMIRES  = $D40F
+
+ROMCHR  = $E0           ; page of the OS character set
+RESBASE = $F0           ; page the resident part runs at
+TIMSTOP = $FDBB         ; resident: stop the SIO timeout timer
+COLDST  = $F4ED         ; resident: cold start
+STUBRUN = $0100         ; STUB is executed here
+
+BOOTQ   = $09           ; OS: successful boot flag
+DOSINI  = $0C           ; OS: RESET init vector (2 bytes)
+OSCOLD  = $0244         ; OS: cold start flag (COLDST)
+
+SRC     = $F0           ; zero page pointers used by the copy loops
+DST     = $F2
+
+        *= $2F00
+
+; --- copy OS character set $E000-$E3FF to $3000-$33FF ----------------------
+; The OS ROM is still on here, so the ROM font can be read. It goes into the
+; first 1K of the resident image, which is moved to $F000 below, where the
+; resident program uses it as its character set (CHBASE = $F0).
+START
+        SEI
+        LDA #$00
+        TAY
+        STY NMIEN       ; no interrupts while the OS is swapped out
+        STA SRC         ; SRC = $E000 (ROM font)
+        STA DST         ; DST = $3000 (start of resident image)
+        LDA #ROMCHR
+        STA SRC+1
+        LDA #>RESIDENT
+        STA DST+1
+CHRLP
+        LDA (SRC),Y     ; copy one page ...
+        STA (DST),Y
+        INY
+        BNE CHRLP
+        INC DST+1       ; ... then step both pointers to the next page
+        INC SRC+1
+        LDA SRC+1
+        CMP #ROMCHR+4   ; 4 pages = 1K font
+        BNE CHRLP
+; --- OS ROM off, move $3000-$3FFF to $F000-$FFFF ----------------------------
+        LDA PORTB
+        AND #$FE        ; PORTB bit 0 = 0: OS ROM off, RAM at $C000-$FFFF
+        ORA #$02        ; bit 1 = 1: BASIC off
+        STA PORTB
+        LDY #$00
+        LDA #RESBASE
+        STA SRC+1       ; now used as destination: $F000
+        LDA #>RESIDENT
+        STA DST+1       ; now used as source: $3000
+MOVLP
+        LDA (DST),Y     ; copy one page from the file image ...
+        STA (SRC),Y     ; ... into the RAM under the OS ROM
+        INY
+        BNE MOVLP
+        INC DST+1
+        INC SRC+1
+        LDA SRC+1
+        BNE MOVLP       ; until the destination wraps past $FFFF
+; --- copy STUB to $0100 and run it ------------------------------------------
+        LDY #STUBEND-STUB ; copies backwards, last byte first
+STUBLP
+        LDA STUB,Y
+        STA STUBRUN,Y
+        DEY
+        BPL STUBLP
+        INY
+        STY OSCOLD      ; OS COLDST flag = 0 (warm start on RESET)
+        STY DOSINI      ; DOSINI lo = $00
+        INY
+        STY BOOTQ       ; BOOT? = 1
+        STY DOSINI+1    ; DOSINI hi = $01 -> RESET runs STUB at $0100
+        JMP STUBRUN
+
+; --- STUB, executed at $0100 ------------------------------------------------
+STUB
+        SEI
+        STA NMIRES
+        LDA #$00
+        TAY
+CLRHW
+        STA DMACTL,Y
+        STA HPOSP0,Y
+        STA AUDF1,Y
+        INY
+        BNE CLRHW
+        LDA PORTB
+        AND #$FE
+        ORA #$FC
+        STA PORTB
+        LDA #$22
+        STA DMACTL
+        LDA #RESBASE    ; font at $F000
+        STA CHBASE
+        LDA #$02
+        STA CHACTL
+        LDA #$03
+        STA SKCTL
+        LDA #$40
+        STA NMIEN
+        JSR TIMSTOP
+        JMP COLDST
+STUBEND                 ; (the loop also copies this one byte)
+
+        .REPT 100
+        .BYTE $00
+        .ENDR
+
+; --- resident part, runs at $F000-$FFFF -------------------------------------
+RESIDENT
+        .INCBIN "scopy14rom.bin"
