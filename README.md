@@ -47,7 +47,8 @@ SCOPY14 copies a whole floppy disk sector by sector, with one or two drives.
 ### How it works
 
 The file is a single Atari DOS segment `$2F00-$3FFF` with no RUN or INIT
-vector, so it is started at `$2F00`.
+vector, so it needs to be started at `$2F00` (not every DOS will do that 
+automatically).
 
 1. **Loader (`$2F00`):** copies the OS character set (`$E000-$E3FF`) to
    `$3000`, switches the OS ROM off and moves `$3000-$3FFF` into the RAM at
