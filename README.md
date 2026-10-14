@@ -1,4 +1,4 @@
-# SCOPY – sectorcopy for Atari 8-bit computers
+# SCOPY14 – sectorcopy for Atari 8-bit computers
 
 Original by Erwin Reuss, Compyshop 06/87
 (c) ABBUC e.V. 2026 (https://abbuc.de)
@@ -47,8 +47,7 @@ SCOPY14 copies a whole floppy disk sector by sector, with one or two drives.
 ### How it works
 
 The file is a single Atari DOS segment `$2F00-$3FFF` with no RUN or INIT
-vector, so it needs to be started at `$2F00` (not every DOS will do that 
-automatically).
+vector, so it is started at `$2F00`.
 
 1. **Loader (`$2F00`):** copies the OS character set (`$E000-$E3FF`) to
    `$3000`, switches the OS ROM off and moves `$3000-$3FFF` into the RAM at
@@ -104,8 +103,6 @@ cmp SCOPY14.COM SCOPY14.NEW
   so long strings are split into pieces of at most 32 characters.
 - ATasm doesn't warn when an equate and a label share a name. Run `make`
   after every change: the byte comparison catches mistakes like that.
-- Not fully identified: what the drive-specific commands `$20`, `$44` and
-  `$51` do. They are only sent to drives that answered the high speed query.
 
 ### Reconstruction tool
 
@@ -117,3 +114,45 @@ tail -c 4096 SCOPY14.COM > rom.bin           # the $3000-$3FFF part
 python3 r2disasm.py rom.bin f000 rom.m65 f4ed,fdbb,fe32,fe6c \
         --data f000-f4ec,fffa-ffff --inline fc05
 ```
+
+## SCOPY15
+
+`SCOPY15.COM` ("(C) 07/88 bibosoft") is the newer version. Its source is
+`scopy15.m65` (loader, stub, vectors, RUN address) and `scopy15rom.m65`
+(resident program, now `$F400-$FFEA`). `make` builds it and compares it with
+`SCOPY15.COM`; the result is byte-identical. ATasm writes the segments sorted
+by address, so `segorder.py` moves the RUN address segment back to the end.
+
+File layout: `$2F00-$2FA3` loader and stub, `$3400-$3FEA` resident program
+(the font part `$3000-$33FF` is no longer in the file, the loader still fills
+it from the ROM), `$3FFA-$3FFF` vectors, `$02E0` RUNAD = `$2F00`.
+The file is 3241 bytes instead of 4358.
+
+Changes against SCOPY14 (the full source diff with a comment for each
+hunk is in [SCOPY15changes.md](SCOPY15changes.md)):
+
+- **Sparse buffer:** all-zero sectors are no longer stored. During reading,
+  the SIO receive routine ORs all bytes into `EMPTY` (`$EF`); `NEXTSECT`
+  only advances the buffer pointer for sectors with data, and a bit map
+  `SECMAP` (`$037D`, 130 bytes) remembers which sectors had data. So more
+  of a disk fits into one pass. When writing, an empty sector is skipped on a
+  formatted target; on an unformatted one (`Formatieren: NEIN`) the send
+  routine sends zeros without reading the buffer.
+- **High speed fallback per sector:** the source drive's divisor is restored
+  before every sector and only the failing sector is retried at 19200 baud.
+  An unreadable sector is kept as if it had data.
+- **Formatting:** the PERCOM block is now sent to every target, not only to
+  high speed drives. A format error is checked with the carry flag.
+- **SIO:** the zero page variables moved from `$21-$2B` to `$E1-$EB` and the
+  command frame from `$023A` to `$A0`. `PUTBYTE` also adds to the checksum,
+  the timeout timer has no `WSYNC` delay and a receive timeout of 50 frames,
+  format commands (`< $30`) get the long wait. `SIOSND` (`$41`) is the
+  `AUDC4` value during SIO: `$A8` for the normal commands, 0 (silent) for the
+  drive specific `$44`, `$4F` and `$51`; `$51` now gets aux `$FFFF`.
+  `FINDDRIVE` takes the unit in X and receives the high speed index in `$00`.
+- **Keys:** the console key debounce waits for 256 identical reads.
+  Shift+Control+Tab (`KBCODE $EC`, checked in the NMI handler) leaves the
+  program: the stub at `$013E` switches the OS ROM on and jumps to `$E477`.
+- **Smaller things:** version "1.5" and the new credit line, the NMI handler
+  no longer saves X and Y, the IRQ handler only switches the interrupts off,
+  the "OPTION aborts" check after the target prompt, `SAVEDBARS` is 80 bytes.
