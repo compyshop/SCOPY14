@@ -68,6 +68,10 @@ vector, so it is started at `$2F00`.
 | `scopy14rom.m65` | resident program, assembled for `$F000`                    |
 | `Makefile`       | builds both parts and compares the result with the original |
 | `r2disasm.py`    | the radare2-based disassembler that made the first draft   |
+| `SCOPY15.COM`, `scopy15.m65`, `scopy15rom.m65` | the newer version and its source (see below) |
+| `SCOPYQD.COM`, `scopyqd.m65`, `scopyqdrom.m65` | the quad density variant and its source (see below) |
+| `SCOPY15changes.md`, `SCOPYQDchanges.md` | source diffs with comments against the previous version |
+| `segorder.py`    | moves the RUN address segment last (SCOPY15 and SCOPYQD)   |
 
 The resident program has to run at `$F000` but is stored at `$3000`.
 ATasm 1.06 has no directive for that, so it is assembled on its own as a
@@ -78,8 +82,8 @@ raw binary and pulled into the loader with `.INCBIN`.
 Requirements: [ATasm](https://github.com/CycoPH/atasm) 1.06 and `make`.
 
 ```sh
-make            # build SCOPY14.NEW and check it against SCOPY14.COM
-make clean      # remove scopy14rom.bin and SCOPY14.NEW
+make            # build SCOPY14/15/QD.NEW and check them against the originals
+make clean      # remove the generated .bin and .NEW files
 ```
 
 By hand:
@@ -103,6 +107,8 @@ cmp SCOPY14.COM SCOPY14.NEW
   so long strings are split into pieces of at most 32 characters.
 - ATasm doesn't warn when an equate and a label share a name. Run `make`
   after every change: the byte comparison catches mistakes like that.
+- Not fully identified: what the drive-specific commands `$20`, `$44` and
+  `$51` do. They are only sent to drives that answered the high speed query.
 
 ### Reconstruction tool
 
@@ -156,3 +162,37 @@ hunk is in [SCOPY15changes.md](SCOPY15changes.md)):
 - **Smaller things:** version "1.5" and the new credit line, the NMI handler
   no longer saves X and Y, the IRQ handler only switches the interrupts off,
   the "OPTION aborts" check after the target prompt, `SAVEDBARS` is 80 bytes.
+
+Not verified by running: there is no Atari emulator on this machine, so the
+test is the byte comparison with the original (`make check15`) and a
+decode of the original binary against the source, not a run of the program.
+The Shift+Control+Tab key code `$EC` is read from the code; the key name is
+my reading of the Atari key codes.
+
+## SCOPYQD
+
+`SCOPYQD.COM` is a modified SCOPY15 for quad density disks (80 tracks,
+double-sided, 1440 sectors of 256 bytes). Its source is `scopyqd.m65`
+(loader, stub, vectors, RUN address) and `scopyqdrom.m65` (resident program,
+`$F400-$FFE9`). `make` builds it (`make checkqd`) and compares it with
+`SCOPYQD.COM`; the result is byte-identical. The program code is SCOPY15's,
+not SCOPY14's: the zero page layout, the SIO routines, the sector bit map and
+the Shift+Control+Tab exit are all there. Only the file layout is like
+SCOPY14's: one segment `$2F00-$3FFF` with the font area and the padding
+stored as zeros, plus the RUN address `$02E0` at the end. The file is 4364
+bytes.
+
+Changes against SCOPY15 (the full source diff with a comment for each hunk is
+in [SCOPYQDchanges.md](SCOPYQDchanges.md)):
+
+- **Texts:** version "2.0", the credit line reads "bibosoft quad by hwl".
+- **Quad density:** the density name "DOUBLE" is now "QUAD". The disk ends at
+  sector 1440 instead of 720 (single density disks use the same test), the
+  progress bar step is 10 instead of 5, and the PERCOM block for this density
+  has step rate 1 and 2 sides.
+- **High speed query:** `FINDDRIVE` receives the answer to command `$3F` in
+  the sector buffer (`SECBUF`, `$0400`) instead of at `$0000`.
+- **Moved:** the sector bit map `SECMAP` is at `$037E` (was `$037D`).
+
+Not verified by running: as for SCOPY15, the test is the byte comparison. The
+meaning of the quad density changes is read from the code.

@@ -1,0 +1,169 @@
+; SCOPYQD.COM - "sectorcopy" for Atari 8-bit computers
+; Disassembled with radare2 (gen.py), reassembles with ATasm 1.06.
+; Original by Erwin Reuss, Compyshop 06/87; version QD (derived from SCOPY15)
+; (c) ABBUC e.V. 2026 (https://abbuc.de)
+; Licensed under GPLv2
+;
+; Build:
+;   atasm -r -oscopyqdrom.bin scopyqdrom.m65   ; resident part ($F400-$FFE9)
+;   atasm -oSCOPYQD.tmp scopyqd.m65            ; Atari DOS binary file
+;   python3 segorder.py SCOPYQD.tmp SCOPYQD.NEW ; RUNAD segment last
+;
+; The file has one segment $2F00-$3FFF (like SCOPY14, unlike SCOPY15) and a
+; RUN vector; the zero filled gaps are stored in the file:
+;   $2F00  loader: copies the ROM character set ($E000-$E3FF) to $3000,
+;          switches the OS ROM off and moves $3000-$3FFF to RAM at
+;          $F000-$FFFF, then copies STUB to $0100 and runs it there.
+;   $2F5E  STUB (runs at $0100): clears hardware, sets up ANTIC/POKEY
+;          and jumps into the resident program. At $013E it also holds
+;          the exit to the OS (Shift+Control+Tab).
+;   $3400  resident program, assembled for $F400 (scopyqdrom.m65). The
+;          font part $3000-$33FF is zero in the file, the loader fills it.
+;   $3FFA  NMI / RESET / IRQ vectors
+;   $02E0  RUNAD = $2F00
+
+HPOSP0  = $D000
+AUDF1   = $D200
+SKCTL   = $D20F
+PORTB   = $D301
+PBCTL   = $D303
+DMACTL  = $D400
+CHACTL  = $D401
+CHBASE  = $D409
+NMIEN   = $D40E
+
+ROMCHR  = $E0           ; page of the OS character set
+RESBASE = $F0           ; page the resident part runs at
+IMAGE   = $30           ; page of the resident image (font part + file)
+TIMSTOP = $FE03         ; resident: stop the SIO timeout timer
+OSENTRY = $E477         ; OS: entry used for the exit
+COLDST  = $F4ED         ; resident: cold start
+NMIADR  = $FE69         ; resident: NMI handler
+IRQADR  = $FEA2         ; resident: IRQ handler
+RUNAD   = $02E0         ; OS: run address
+STUBRUN = $0100         ; STUB is executed here
+
+BOOTQ   = $09           ; OS: successful boot flag
+DOSINI  = $0C           ; OS: RESET init vector (2 bytes)
+OSCOLD  = $0244         ; OS: cold start flag (COLDST)
+
+SRC     = $F0           ; zero page pointers used by the copy loops
+DST     = $F2
+
+        *= $2F00
+
+; --- copy OS character set $E000-$E3FF to $3000-$33FF ----------------------
+; The OS ROM is still on here, so the ROM font can be read. It goes into the
+; first 1K of the resident image, which is moved to $F000 below, where the
+; resident program uses it as its character set (CHBASE = $F0).
+START
+        SEI
+        LDA #$00
+        TAY
+        STY NMIEN       ; no interrupts while the OS is swapped out
+        STA SRC         ; SRC = $E000 (ROM font)
+        STA DST         ; DST = $3000 (start of resident image)
+        LDA #ROMCHR
+        STA SRC+1
+        LDA #IMAGE
+        STA DST+1
+CHRLP
+        LDA (SRC),Y     ; copy one page ...
+        STA (DST),Y
+        INY
+        BNE CHRLP
+        INC DST+1       ; ... then step both pointers to the next page
+        INC SRC+1
+        LDA SRC+1
+        CMP #ROMCHR+4   ; 4 pages = 1K font
+        BNE CHRLP
+; --- OS ROM off, move $3000-$3FFF to $F000-$FFFF ----------------------------
+        LDA PORTB
+        AND #$FE        ; PORTB bit 0 = 0: OS ROM off, RAM at $C000-$FFFF
+        ORA #$02        ; bit 1 = 1: BASIC off
+        STA PORTB
+        LDA #RESBASE    ; (Y is still 0)
+        STA SRC+1       ; now used as destination: $F000
+        LDA #IMAGE
+        STA DST+1       ; now used as source: $3000
+MOVLP
+        LDA (DST),Y     ; copy one page from the file image ...
+        STA (SRC),Y     ; ... into the RAM under the OS ROM
+        INY
+        BNE MOVLP
+        INC DST+1
+        INC SRC+1
+        LDA SRC+1
+        BNE MOVLP       ; until the destination wraps past $FFFF
+; --- copy STUB to $0100 and run it ------------------------------------------
+        LDY #STUBEND-STUB ; copies backwards, last byte first
+STUBLP
+        LDA STUB,Y
+        STA STUBRUN,Y
+        DEY
+        BPL STUBLP
+        INY
+        STY OSCOLD      ; OS COLDST flag = 0 (warm start on RESET)
+        STY DOSINI      ; DOSINI lo = $00
+        INY
+        STY BOOTQ       ; BOOT? = 1
+        STY DOSINI+1    ; DOSINI hi = $01 -> RESET runs STUB at $0100
+        JMP STUBRUN
+
+; --- STUB, executed at $0100 ------------------------------------------------
+STUB
+        SEI
+        LDA #$00
+        TAY
+CLRHW
+        STA DMACTL,Y
+        STA HPOSP0,Y
+        STA AUDF1,Y
+        INY
+        BNE CLRHW
+        LDA PORTB
+        AND #$FE
+        ORA #$FC
+        STA PORTB
+        LDA #$3C        ; PBCTL $3C: SIO command line high
+        STA PBCTL
+        LDA #RESBASE    ; font at $F000
+        STA CHBASE
+        LDA #$02
+        STA CHACTL
+        LDA #$22
+        STA DMACTL
+        LDA #$03
+        STA SKCTL
+        LDA #$40
+        STA NMIEN
+        JSR TIMSTOP
+        JMP COLDST
+; Exit to the OS, entered at $013E from the NMI handler (Shift+Control+Tab):
+; OS ROM back on, then jump into the OS (the RAM under it is left as is).
+        LDA #$FF
+        STA PORTB
+        JMP OSENTRY
+STUBEND                 ; (the loop also copies one byte past the end)
+
+; --- zero fill up to the resident part ($2FA4-$33FF; $3000-$33FF becomes ----
+; the font) -------------------------------------------------------------------
+        .REPT $3400-*
+        .BYTE $00
+        .ENDR
+
+; --- resident part, runs at $F400-$FFE9 -------------------------------------
+RESIDENT
+        .INCBIN "scopyqdrom.bin"
+        .REPT $3FFA-*
+        .BYTE $00
+        .ENDR
+
+; --- vectors at $FFFA-$FFFF (the loader moves them with the rest) -----------
+        .WORD NMIADR    ; NMI
+        .WORD $0000     ; RESET (unused)
+        .WORD IRQADR    ; IRQ
+
+; --- run address ------------------------------------------------------------
+        *= RUNAD
+        .WORD START

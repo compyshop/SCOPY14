@@ -1,4 +1,4 @@
-all: check check15
+all: check check15 checkqd
 
 # --- SCOPY14 ---
 scopy14rom.bin: scopy14rom.m65
@@ -17,10 +17,22 @@ scopy15rom.bin: scopy15rom.m65
 SCOPY15.NEW: scopy15.m65 scopy15rom.bin segorder.py
 	atasm -oSCOPY15.tmp scopy15.m65
 	python3 segorder.py SCOPY15.tmp SCOPY15.NEW
-	rm -f SCOPY15.tmp
+	rm -f SCOPY15.tmp scopyqdrom.bin SCOPYQD.NEW SCOPYQD.tmp
 
 check15: SCOPY15.NEW
 	cmp SCOPY15.COM SCOPY15.NEW && echo "identical to SCOPY15.COM"
 
+# --- SCOPYQD (same segment handling as SCOPY15) ---
+scopyqdrom.bin: scopyqdrom.m65
+	atasm -r -oscopyqdrom.bin scopyqdrom.m65
+
+SCOPYQD.NEW: scopyqd.m65 scopyqdrom.bin segorder.py
+	atasm -oSCOPYQD.tmp scopyqd.m65
+	python3 segorder.py SCOPYQD.tmp SCOPYQD.NEW
+	rm -f SCOPYQD.tmp
+
+checkqd: SCOPYQD.NEW
+	cmp SCOPYQD.COM SCOPYQD.NEW && echo "identical to SCOPYQD.COM"
+
 clean:
-	rm -f scopy14rom.bin SCOPY14.NEW scopy15rom.bin SCOPY15.NEW SCOPY15.tmp
+	rm -f scopy14rom.bin SCOPY14.NEW scopy15rom.bin SCOPY15.NEW SCOPY15.tmp scopyqdrom.bin SCOPYQD.NEW SCOPYQD.tmp
