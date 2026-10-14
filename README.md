@@ -1,4 +1,4 @@
-# SCOPY14 – sectorcopy for Atari 8-bit computers
+# SCOPY – sectorcopy for Atari 8-bit computers
 
 Original by Erwin Reuss, Compyshop 06/87
 (c) ABBUC e.V. 2026 (https://abbuc.de)
